@@ -1,0 +1,68 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - apt-key adv --refresh-keys --keyserver keyserver.ubuntu.com
+      - apt-get update && apt-get -y install python3-pip jq
+      - pip3 install --upgrade awscli
+      - pip3 install boto3 botocore requests semantic_version
+      - echo "Pulling SHARED_ENV from Secrets Manager"
+      - eval $(./codebuild_get_secret_env.sh 'SHARED_ENV')
+      - echo "Pulling BUILD_ENV from Secrets Manager -> ${BUILD_ENV_SECRET_KEY}"
+      - eval $(./codebuild_get_secret_env.sh "${BUILD_ENV_SECRET_KEY}")
+      - ./create_app_init.sh
+      - echo "$DOCKERHUB_PASSWORD" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+  pre_build:
+    commands:
+      - |
+        eval $(
+          aws s3 cp "s3://${ENV_BUCKET}/${APP_ENV_PATH}/version.txt" - |
+          sed 's/^\s*#.*//' |
+          sed '/^\s*$/d' |
+          sed 's/^/export /'
+        )
+      - python3 semver_v4.py bucket="$ENV_BUCKET" envpath="$APP_ENV_PATH"
+      - $(aws ecr get-login --region "$AWS_DEFAULT_REGION" --no-include-email)
+      - export BUILDSPEC_IMG_REPO="$BUILDSPEC_IMG_HOST/$BUILDSPEC_ECS_SERVICE_NAME"
+      - export BUILDSPEC_IMG_URI="$BUILDSPEC_IMG_REPO:$APP_VERSION"
+      - export BUILDSPEC_LATEST_TAG="$BUILDSPEC_IMG_REPO:latest"
+  build:
+    commands:
+      - echo "Build started @ $(date)"
+      - echo "BUILDSPEC_IMG_URI => $BUILDSPEC_IMG_URI"
+      - echo "BUILDSPEC_LATEST_TAG => $BUILDSPEC_LATEST_TAG"
+      - |
+        docker build  --build-arg BUNDLE_GITHUB__COM \
+                      --build-arg BUNDLE_ENTERPRISE__CONTRIBSYS__COM \
+                      --build-arg RUNTIME_ENV_SECRET_KEY \
+                      --build-arg COMMIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION}" \
+                      --build-arg BUILD_TAG="${BUILDSPEC_IMG_URI}" \
+                      -t "$BUILDSPEC_IMG_URI" -t "$BUILDSPEC_LATEST_TAG" .
+      - echo "Build completed @ $(date)"
+  post_build:
+    commands:
+      - echo "Pushing image to repository $BUILDSPEC_IMG_REPO"
+      - docker push "$BUILDSPEC_IMG_URI"
+      - docker push "$BUILDSPEC_LATEST_TAG"
+      - ./codebuild_add_task.sh 'bundle exec rake db:migrate'
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$BUILDSPEC_ECS_SERVICE_NAME" "$BUILDSPEC_IMG_URI" > /tmp/imagedefinitions.json
+      - printf '[{"name":"%s-web","imageUri":"%s"}]' "$BUILDSPEC_ECS_SERVICE_NAME" "$BUILDSPEC_IMG_URI" > /tmp/web-imagedefinitions.json
+      - printf '[{"name":"%s-worker","imageUri":"%s"}]' "$BUILDSPEC_ECS_SERVICE_NAME" "$BUILDSPEC_IMG_URI" > /tmp/worker-imagedefinitions.json
+      - printf '[{"name":"%s-sftp","imageUri":"%s"}]' "$BUILDSPEC_ECS_SERVICE_NAME" "$BUILDSPEC_IMG_URI" > /tmp/sftp-imagedefinitions.json
+      - cat /tmp/imagedefinitions.json
+      - cat /tmp/web-imagedefinitions.json
+      - cat /tmp/worker-imagedefinitions.json
+      - cat /tmp/sftp-imagedefinitions.json
+      - |
+        python3 trigger_webhook.py service="$BUILDSPEC_ECS_SERVICE_NAME" \
+                                   image="$BUILDSPEC_IMG_URI" \
+                                   webhook_url="$WEBHOOK_URL" \
+                                   channel="$BUILDSPEC_SLACK_NOTIFY_CHANNEL"
+artifacts:
+  files:
+    - /tmp/imagedefinitions.json
+    - /tmp/web-imagedefinitions.json
+    - /tmp/worker-imagedefinitions.json
+    - /tmp/sftp-imagedefinitions.json
+  discard-paths: yes
