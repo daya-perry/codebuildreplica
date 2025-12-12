@@ -3,7 +3,6 @@ version: 0.2
 phases:
   install:
     commands:
-      - apt-get update && apt-get -y install python3-pip jq
       - pip3 install --upgrade awscli
       - pip3 install boto3 botocore requests semantic_version
       - echo "Pulling SHARED_ENV from Secrets Manager"
@@ -65,4 +64,5 @@ artifacts:
     - /tmp/worker-imagedefinitions.json
     - /tmp/sftp-imagedefinitions.json
   discard-paths: yes
+
 
